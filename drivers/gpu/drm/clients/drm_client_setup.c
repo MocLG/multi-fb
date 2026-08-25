@@ -48,6 +48,15 @@ void drm_client_setup(struct drm_device *dev, const struct drm_format_info *form
 			drm_warn(dev, "Failed to set up DRM client; error %d\n", ret);
 		return;
 	}
+
+	if (!strcmp(drm_client_default, "fbdev-multi")) {
+		int ret;
+
+		ret = drm_fbdev_multi_client_setup(dev, format);
+		if (ret)
+			drm_warn(dev, "Failed to set up DRM client; error %d\n", ret);
+		return;
+	}
 #endif
 
 #ifdef CONFIG_DRM_CLIENT_LOG

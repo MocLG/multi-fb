@@ -8,9 +8,16 @@ struct drm_format_info;
 
 #ifdef CONFIG_DRM_FBDEV_EMULATION
 int drm_fbdev_client_setup(struct drm_device *dev, const struct drm_format_info *format);
+int drm_fbdev_multi_client_setup(struct drm_device *dev, const struct drm_format_info *format);
 #else
 static inline int drm_fbdev_client_setup(struct drm_device *dev,
 					 const struct drm_format_info *format)
+{
+	return 0;
+}
+
+static inline int drm_fbdev_multi_client_setup(struct drm_device *dev,
+						const struct drm_format_info *format)
 {
 	return 0;
 }
