@@ -68,8 +68,31 @@ the primary never got a buffer.
 | `fbdev-multi: [CRTC:..] has no fb device` | a driven CRTC got no sibling; expected only for a connector that was dark at boot |
 | nothing                              | the client is not failing commits; the WM breakage is elsewhere       |
 
-If all of them are empty, reboot with `drm.debug=0x4` added to the command line
-and run the grep again. The atomic check failures only print at that level.
+If all of them are empty, reboot with `drm.debug=0x14` added to the command
+line and run the grep again.
+
+The value matters. `drm.debug` is a bitmask over `enum drm_debug_category` in
+`include/drm/drm_print.h`, and the three messages above are not all in the same
+category:
+
+| Message                                   | Macro            | Category        | Bit  |
+|-------------------------------------------|------------------|-----------------|------|
+| `[CRTC:n:name] desired mode ... set`      | `drm_dbg_kms`    | `DRM_UT_KMS`    | 0x4  |
+| `fbdev-multi: [CRTC:..] has no fb device` | `drm_dbg_kms`    | `DRM_UT_KMS`    | 0x4  |
+| `Invalid source coordinates`              | `drm_dbg_kms`    | `DRM_UT_KMS`    | 0x4  |
+| `CRTC set but no FB`                      | `drm_dbg_atomic` | `DRM_UT_ATOMIC` | 0x10 |
+
+`0x4` alone hides `CRTC set but no FB`, which is the most diagnostic line of
+the set. `0x14` covers both. `0x3ff` turns on everything and is very verbose.
+
+The parameter is mode 0600, so it can also be flipped at runtime without a
+reboot:
+
+    echo 0x14 | sudo tee /sys/module/drm/parameters/debug
+
+That is enough for anything triggered by a hotplug, since replugging a monitor
+re-runs the probe. Messages emitted during driver probe at boot still need the
+command line.
 
 ---
 
