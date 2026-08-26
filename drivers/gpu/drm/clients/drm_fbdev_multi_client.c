@@ -322,6 +322,50 @@ static void drm_fbdev_multi_publish_one(struct drm_fbdev_multi_helper *helper)
 }
 
 /*
+ * Upper bound for a re-probe: the smallest buffer any helper owns.
+ *
+ * drm_fb_helper_hotplug_event() constrains its probe to the size of the one
+ * buffer the stock client allocated, because that buffer is never resized. The
+ * same applies per helper here, but drm_client_modeset_probe() takes a single
+ * device-wide limit, so the only bound that holds for every CRTC at once is the
+ * minimum. A probe that is free to pick a larger mode leaves that CRTC with a
+ * mode its own buffer cannot scan out, and drm_fbdev_multi_publish_fbs() then
+ * has to disable it for good, since drm_fbdev_multi_alloc_fb() never
+ * reallocates.
+ *
+ * An asymmetric setup can therefore lose console resolution on the first
+ * hotplug. It cannot go dark, which is the trade being made. Zero means
+ * nothing is allocated yet and the probe runs unconstrained.
+ */
+static void drm_fbdev_multi_probe_limit(struct drm_fbdev_multi *multi,
+					unsigned int *width, unsigned int *height)
+{
+	struct drm_fbdev_multi_helper *sibling;
+	struct drm_framebuffer *fb;
+
+	*width = 0;
+	*height = 0;
+
+	fb = multi->primary.fb_helper.fb;
+	if (!fb)
+		return;
+
+	*width = fb->width;
+	*height = fb->height;
+
+	mutex_lock(&multi->siblings_lock);
+	list_for_each_entry(sibling, &multi->siblings, sibling_node) {
+		fb = sibling->fb_helper.fb;
+		if (!fb)
+			continue;
+
+		*width = min(*width, fb->width);
+		*height = min(*height, fb->height);
+	}
+	mutex_unlock(&multi->siblings_lock);
+}
+
+/*
  * Republish every helper's fb into the primary's modesets[] array and
  * release the driven entries that no helper owns. Must be called after
  * every drm_client_modeset_probe() on the primary's client, and before
@@ -682,6 +726,7 @@ static int drm_fbdev_multi_primary_hotplug(struct drm_client_dev *client)
 	struct drm_device *dev = client->dev;
 	struct drm_fbdev_multi_helper *sibling;
 	struct drm_mode_set *modeset;
+	unsigned int width, height;
 	bool siblings_ready;
 	int ret;
 
@@ -703,7 +748,8 @@ static int drm_fbdev_multi_primary_hotplug(struct drm_client_dev *client)
 	 * every struct drm_mode_set.fb, so the publish pass below still has
 	 * to run to keep the array committable.
 	 */
-	ret = drm_client_modeset_probe(client, 0, 0);
+	drm_fbdev_multi_probe_limit(multi, &width, &height);
+	ret = drm_client_modeset_probe(client, width, height);
 	if (ret)
 		drm_warn(dev, "fbdev-multi: modeset probe failed: %d\n", ret);
 
