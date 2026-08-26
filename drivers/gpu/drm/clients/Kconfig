@@ -103,6 +103,15 @@ config DRM_CLIENT_DEFAULT_FBDEV
 	  Use fbdev emulation as default drm client. This is needed to have
 	  fbcon on top of a drm driver.
 
+config DRM_CLIENT_DEFAULT_FBDEV_MULTI
+	bool "fbdev-multi"
+	depends on DRM_FBDEV_EMULATION
+	help
+	  Use fbdev emulation as default drm client, with one fbdev device
+	  per driven CRTC instead of a single one spanning every output. Each
+	  output can then be bound to its own virtual terminal with
+	  con2fbmap(8) and rotated independently of the others.
+
 config DRM_CLIENT_DEFAULT_LOG
 	bool "log"
 	depends on DRM_CLIENT_LOG
@@ -117,6 +126,7 @@ config DRM_CLIENT_DEFAULT
        string
        depends on DRM_CLIENT
        default "fbdev" if DRM_CLIENT_DEFAULT_FBDEV
+       default "fbdev-multi" if DRM_CLIENT_DEFAULT_FBDEV_MULTI
        default "log" if DRM_CLIENT_DEFAULT_LOG
        default ""
 
