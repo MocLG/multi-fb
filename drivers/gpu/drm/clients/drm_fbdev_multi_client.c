@@ -677,10 +677,24 @@ static void drm_fbdev_multi_register_fbs(struct drm_fbdev_multi *multi)
 	struct drm_fbdev_multi_helper *sibling;
 	bool failed = false;
 
+	/*
+	 * Both drm_fbdev_multi_client_setup() and the primary's ->hotplug
+	 * call this, and a hotplug event can fire the moment setup publishes
+	 * siblings_ready. Without a lock two threads can each see
+	 * helper->registered clear and call register_framebuffer() twice on
+	 * the same fb_info.
+	 *
+	 * The primary's registration is what hands the device to fbcon, so
+	 * this nests console_lock, and fb_set_par under it, inside
+	 * siblings_lock. That is safe in that direction only: put_fb_info(),
+	 * whose fb_destroy path ends in drm_fbdev_multi_sibling_free() and
+	 * takes siblings_lock, is never called with console_lock held.
+	 */
+	mutex_lock(&multi->siblings_lock);
+
 	if (drm_fbdev_multi_register_fb(&multi->primary))
 		failed = true;
 
-	mutex_lock(&multi->siblings_lock);
 	list_for_each_entry(sibling, &multi->siblings, sibling_node) {
 		if (drm_fbdev_multi_register_fb(sibling))
 			failed = true;
@@ -708,11 +722,20 @@ static void drm_fbdev_multi_unregister(struct drm_client_dev *client)
 		 */
 		drm_fb_helper_unregister_info(&helper->fb_helper);
 	} else {
+		struct drm_fb_helper *fb_helper = &helper->fb_helper;
+
 		/*
 		 * Partially initialized client. The fbdev core never took a
-		 * reference on the fb_info, so no fb_destroy will run for it.
+		 * reference on the fb_info, so no fb_destroy and hence no
+		 * drm_fb_helper_fini() will run for it. That is the only thing
+		 * that clears struct drm_device.fb_helper, which the primary
+		 * set from its ->hotplug, so drop it here or it is left
+		 * pointing at freed memory.
 		 */
-		drm_fbdev_multi_release_info(&helper->fb_helper);
+		if (fb_helper->dev->fb_helper == fb_helper)
+			fb_helper->dev->fb_helper = NULL;
+
+		drm_fbdev_multi_release_info(fb_helper);
 		drm_client_release(client);
 	}
 }
