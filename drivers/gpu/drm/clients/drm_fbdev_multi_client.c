@@ -385,6 +385,19 @@ static void drm_fbdev_multi_publish_fbs(struct drm_fbdev_multi *multi)
 	list_for_each_entry(sibling, &multi->siblings, sibling_node)
 		drm_fbdev_multi_publish_one(sibling);
 
+	/*
+	 * A driven entry with no fb only means nobody can paint it once
+	 * drm_fbdev_multi_client_setup() has finished provisioning siblings.
+	 * Before that the entries those siblings are about to claim are
+	 * fb-less by construction, and releasing one here would drop the
+	 * connectors that drm_fbdev_multi_setup_siblings() looks the entry up
+	 * by, so the sibling would never be created. Nothing can commit the
+	 * array in that window either, because no fb_info is registered until
+	 * siblings_ready is set.
+	 */
+	if (!multi->siblings_ready)
+		goto out;
+
 	drm_client_for_each_modeset(modeset, primary_client) {
 		if (!modeset->mode || modeset->fb)
 			continue;
@@ -395,6 +408,7 @@ static void drm_fbdev_multi_publish_fbs(struct drm_fbdev_multi *multi)
 		drm_fbdev_multi_release_modeset(dev, modeset);
 	}
 
+out:
 	mutex_unlock(&primary_client->modeset_mutex);
 	mutex_unlock(&multi->siblings_lock);
 }
