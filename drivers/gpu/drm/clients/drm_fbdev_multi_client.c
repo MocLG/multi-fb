@@ -7,6 +7,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
+#include <drm/drm_atomic.h>
 #include <drm/drm_client.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
@@ -16,10 +17,13 @@
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_mode_config.h>
+#include <drm/drm_mode_object.h>
 #include <drm/drm_modes.h>
+#include <drm/drm_modeset_lock.h>
 #include <drm/drm_print.h>
 
 #include "drm_crtc_internal.h"
+#include "drm_internal.h"
 
 #include "drm_client_internal.h"
 
@@ -110,8 +114,10 @@ struct drm_fbdev_multi_helper {
 	 */
 	bool registered;
 	/*
-	 * Sibling-only: a per-instance copy of the driver's fb_ops with
-	 * fb_set_par/fb_pan_display/fb_blank/fb_destroy replaced.
+	 * A per-instance copy of the driver's fb_ops. The primary only
+	 * replaces fb_blank, to keep a console blank from turning off the
+	 * CRTCs the siblings own. A sibling additionally replaces
+	 * fb_set_par/fb_pan_display/fb_destroy and drops fb_blank.
 	 * dev->driver->fbdev_probe() points info->fbops at a *driver-static*
 	 * struct fb_ops whose default fb_set_par/fb_pan_display/fb_blank
 	 * (DRM_FB_HELPER_DEFAULT_OPS) all operate on info->par's own
@@ -414,6 +420,160 @@ out:
 }
 
 /*
+ * Per-CRTC DPMS
+ *
+ * The stock drm_fb_helper_blank() reaches drm_client_modeset_dpms(), which
+ * commits the primary's whole modesets[] array with struct drm_crtc_state.active
+ * cleared on every entry. On this client that array covers every driven CRTC on
+ * the device, so a console blank timeout on the primary's own VT turned off all
+ * of the monitors, including the ones a sibling owns.
+ *
+ * Touch one CRTC's .active instead, leaving its mode, its plane state and every
+ * other CRTC alone. The drm_master_internal_acquire() check is kept from the
+ * stock path: it holds master_mutex across the commit and fails outright if
+ * anything already holds the device, so a live compositor still gets -EBUSY
+ * rather than a commit racing its own.
+ */
+
+static int drm_fbdev_multi_dpms_atomic(struct drm_fbdev_multi_helper *helper,
+				       struct drm_crtc *crtc, bool active)
+{
+	struct drm_device *dev = helper->fb_helper.dev;
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_crtc_state *crtc_state;
+	struct drm_atomic_commit *state;
+	int ret;
+
+	drm_modeset_acquire_init(&ctx, 0);
+
+	state = drm_atomic_commit_alloc(dev);
+	if (!state) {
+		ret = -ENOMEM;
+		goto out_ctx;
+	}
+
+	state->acquire_ctx = &ctx;
+retry:
+	crtc_state = drm_atomic_get_crtc_state(state, crtc);
+	if (IS_ERR(crtc_state)) {
+		ret = PTR_ERR(crtc_state);
+		goto out_state;
+	}
+
+	crtc_state->active = active;
+
+	ret = drm_atomic_commit(state);
+
+out_state:
+	if (ret == -EDEADLK)
+		goto backoff;
+
+	drm_atomic_commit_put(state);
+out_ctx:
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+
+	return ret;
+
+backoff:
+	drm_atomic_commit_clear(state);
+	drm_modeset_backoff(&ctx);
+
+	goto retry;
+}
+
+static void drm_fbdev_multi_dpms_legacy(struct drm_fbdev_multi_helper *helper,
+					struct drm_mode_set *modeset, int dpms_mode)
+{
+	struct drm_device *dev = helper->fb_helper.dev;
+	struct drm_modeset_acquire_ctx ctx;
+	unsigned int i;
+	int ret;
+
+	DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, ret);
+	if (modeset->crtc->enabled) {
+		for (i = 0; i < modeset->num_connectors; i++) {
+			struct drm_connector *connector = modeset->connectors[i];
+
+			connector->funcs->dpms(connector, dpms_mode);
+			drm_object_property_set_value(&connector->base,
+						      dev->mode_config.dpms_property,
+						      dpms_mode);
+		}
+	}
+	DRM_MODESET_LOCK_ALL_END(dev, ctx, ret);
+}
+
+static int drm_fbdev_multi_dpms(struct drm_fbdev_multi_helper *helper, int dpms_mode)
+{
+	struct drm_client_dev *primary_client = &helper->multi->primary.fb_helper.client;
+	struct drm_device *dev = helper->fb_helper.dev;
+	struct drm_mode_set *modeset = helper->modeset;
+	struct drm_crtc *crtc = NULL;
+	int ret;
+
+	if (!drm_master_internal_acquire(dev))
+		return -EBUSY;
+
+	mutex_lock(&primary_client->modeset_mutex);
+	if (modeset && modeset->mode && modeset->num_connectors && modeset->fb)
+		crtc = modeset->crtc;
+
+	if (!crtc) {
+		mutex_unlock(&primary_client->modeset_mutex);
+		drm_master_internal_release(dev);
+		return -ENODEV;
+	}
+
+	if (drm_drv_uses_atomic_modeset(dev)) {
+		/*
+		 * Only .active is touched, and drm_atomic_get_crtc_state()
+		 * takes the CRTC's own modeset lock, so the primary's
+		 * modeset_mutex is not needed past reading the entry.
+		 */
+		mutex_unlock(&primary_client->modeset_mutex);
+		ret = drm_fbdev_multi_dpms_atomic(helper, crtc,
+						  dpms_mode == DRM_MODE_DPMS_ON);
+	} else {
+		drm_fbdev_multi_dpms_legacy(helper, modeset, dpms_mode);
+		mutex_unlock(&primary_client->modeset_mutex);
+		ret = 0;
+	}
+
+	drm_master_internal_release(dev);
+
+	return ret;
+}
+
+static int drm_fbdev_multi_fb_blank(int blank, struct fb_info *info)
+{
+	struct drm_fbdev_multi_helper *helper = to_multi_helper(info->par);
+
+	if (oops_in_progress)
+		return -EBUSY;
+
+	switch (blank) {
+	case FB_BLANK_UNBLANK:
+		drm_fbdev_multi_dpms(helper, DRM_MODE_DPMS_ON);
+		break;
+	case FB_BLANK_NORMAL:
+		drm_fbdev_multi_dpms(helper, DRM_MODE_DPMS_STANDBY);
+		break;
+	case FB_BLANK_HSYNC_SUSPEND:
+		drm_fbdev_multi_dpms(helper, DRM_MODE_DPMS_STANDBY);
+		break;
+	case FB_BLANK_VSYNC_SUSPEND:
+		drm_fbdev_multi_dpms(helper, DRM_MODE_DPMS_SUSPEND);
+		break;
+	case FB_BLANK_POWERDOWN:
+		drm_fbdev_multi_dpms(helper, DRM_MODE_DPMS_OFF);
+		break;
+	}
+
+	return 0;
+}
+
+/*
  * Sibling fb_ops overrides -- see the struct
  * drm_fbdev_multi_helper.fbops comment for why the stock
  * DRM_FB_HELPER_DEFAULT_OPS versions of set_par/pan_display/blank are
@@ -569,40 +729,49 @@ static int drm_fbdev_multi_alloc_fb(struct drm_fbdev_multi_helper *helper)
 	if (ret)
 		goto err_release_info;
 
-	if (helper != &helper->multi->primary) {
-		/*
-		 * Not every fbdev_probe implementation honors the fb_helper it
-		 * is handed: i915 fills the fb_info in from struct
-		 * drm_device.fb_helper, which is always the primary. Every
-		 * fbops callback of this sibling would then resolve to the
-		 * primary's helper, and its console writes would land in the
-		 * primary's buffer. Give up on the sibling instead.
-		 *
-		 * Unwinding the driver's probe is not possible here: its
-		 * fb_destroy resolves everything it has to free through
-		 * info->par, i.e. through somebody else's helper. Drop only
-		 * what this client owns and leave the rest; the caller stops
-		 * provisioning siblings on -EOPNOTSUPP, so this is bounded to
-		 * one buffer on such a driver.
-		 */
-		if (info->par != fb_helper) {
-			drm_warn(dev, "fbdev-multi: %s does not support more than one fb device\n",
-				 dev->driver->name);
-			drm_fbdev_multi_release_info(fb_helper);
-			fb_helper->fb = NULL;
-			fb_helper->buffer = NULL;
-			return -EOPNOTSUPP;
-		}
+	/*
+	 * Not every fbdev_probe implementation honors the fb_helper it is
+	 * handed: i915 fills the fb_info in from struct drm_device.fb_helper,
+	 * which is always the primary. Every fbops callback of such a sibling
+	 * would resolve to the primary's helper, and its console writes would
+	 * land in the primary's buffer. Give up on the sibling instead.
+	 *
+	 * Unwinding the driver's probe is not possible here: its fb_destroy
+	 * resolves everything it has to free through info->par, i.e. through
+	 * somebody else's helper. Drop only what this client owns and leave
+	 * the rest; the caller stops provisioning siblings on -EOPNOTSUPP, so
+	 * this is bounded to one buffer on such a driver.
+	 */
+	if (helper != &helper->multi->primary && info->par != fb_helper) {
+		drm_warn(dev, "fbdev-multi: %s does not support more than one fb device\n",
+			 dev->driver->name);
+		drm_fbdev_multi_release_info(fb_helper);
+		fb_helper->fb = NULL;
+		fb_helper->buffer = NULL;
+		return -EOPNOTSUPP;
+	}
 
-		helper->fbops = *info->fbops;
+	helper->fbops = *info->fbops;
+
+	if (helper == &helper->multi->primary) {
+		helper->fbops.fb_blank = drm_fbdev_multi_fb_blank;
+	} else {
 		helper->driver_fb_destroy = info->fbops->fb_destroy;
 		helper->fbops.fb_set_par = drm_fbdev_multi_sibling_set_par;
 		helper->fbops.fb_pan_display = drm_fbdev_multi_sibling_pan_display;
+		/*
+		 * Left unimplemented rather than pointed at
+		 * drm_fbdev_multi_fb_blank(): a sibling never commits anything
+		 * today (see drm_fbdev_multi_sibling_set_par()), and giving it
+		 * a commit path is a change to make on its own, not folded
+		 * into narrowing the primary's blank.
+		 */
 		helper->fbops.fb_blank = NULL;
 		if (helper->driver_fb_destroy)
 			helper->fbops.fb_destroy = drm_fbdev_multi_sibling_destroy;
-		info->fbops = &helper->fbops;
 	}
+
+	info->fbops = &helper->fbops;
 
 	strscpy(fb_helper->fb->comm, "[fbcon]", sizeof(fb_helper->fb->comm));
 
